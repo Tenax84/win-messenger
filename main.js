@@ -195,6 +195,7 @@ function createWindow() {
     y: positionValid ? windowBounds.y : undefined,
     autoHideMenuBar: true,
     title: 'Messenger',
+    icon: path.join(__dirname, 'build', 'icon.ico'),
   });
 
   // Hide the menu bar completely
