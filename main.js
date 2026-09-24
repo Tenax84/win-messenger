@@ -8,6 +8,7 @@ const store = new Store({
   defaults: {
     windowBounds: { x: undefined, y: undefined, width: 1024, height: 768 },
     isMaximized: false,
+    cleanExit: true,
   },
 });
 
@@ -190,10 +191,84 @@ function openVideoWindow(url) {
   videoView.webContents.focus();
 }
 
+// Facebook first paints a placeholder skeleton (fake sidebar, empty chat) and
+// only fills in the real chats later - cover the messenger view with a loading
+// screen until the real UI is there
+const LOADING_BG = '#18191a';
+const LOADING_TIMEOUT_MS = 30000;
+
+// True once the page shows something real: the chat list (plus the open
+// conversation's composer or a dialog, e.g. the encrypted chat PIN prompt),
+// or a non-messenger page such as the login form
+const READY_CHECK_JS = `
+(() => {
+  if (!location.pathname.startsWith('/messages')) return document.readyState === 'complete';
+  const hasThreads = !!document.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]');
+  if (!hasThreads) return false;
+  if (!/\\/t\\//.test(location.pathname)) return true;
+  return !!document.querySelector('[role="textbox"][contenteditable="true"], [role="dialog"]');
+})()
+`;
+
+let loadingView;
+let loadingPoll;
+let loadingTimeout;
+
+function showLoading() {
+  if (!mainWindow || loadingView) return;
+  loadingView = new BrowserView({
+    webPreferences: { nodeIntegration: false, contextIsolation: true },
+  });
+  loadingView.setBackgroundColor(LOADING_BG);
+  mainWindow.addBrowserView(loadingView);
+  updateViewBounds();
+  loadingView.webContents.loadFile(path.join(__dirname, 'loading.html'));
+
+  // only check the new document, not the one being replaced (e.g. on logout)
+  let navigated = false;
+  view.webContents.once('did-navigate', () => { navigated = true; });
+  loadingPoll = setInterval(async () => {
+    if (!navigated || !view || view.webContents.isDestroyed()) return;
+    try {
+      if (await view.webContents.executeJavaScript(READY_CHECK_JS)) hideLoading();
+    } catch {}
+  }, 300);
+  // never leave the user stuck behind the loading screen
+  loadingTimeout = setTimeout(hideLoading, LOADING_TIMEOUT_MS);
+}
+
+function hideLoading() {
+  clearInterval(loadingPoll);
+  clearTimeout(loadingTimeout);
+  if (!loadingView) return;
+  const lv = loadingView;
+  loadingView = null;
+  const remove = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.removeBrowserView(lv);
+    if (!lv.webContents.isDestroyed()) lv.webContents.destroy();
+  };
+  // fade out, then remove
+  lv.webContents.executeJavaScript(`document.body.classList.add('hide')`).catch(() => {});
+  setTimeout(remove, 260);
+}
+
+function isMessengerPage(url) {
+  try {
+    const u = new URL(url);
+    return (
+      (u.hostname.endsWith('facebook.com') && u.pathname.startsWith('/messages')) ||
+      u.hostname.endsWith('messenger.com')
+    );
+  } catch {
+    return false;
+  }
+}
+
 function updateViewBounds() {
   if (!mainWindow || !view) return;
   const [width, height] = mainWindow.getContentSize();
   view.setBounds({ x: 0, y: -BANNER_HEIGHT, width, height: height + BANNER_HEIGHT });
+  if (loadingView) loadingView.setBounds({ x: 0, y: 0, width, height });
   updateVideoViewBounds();
 }
 
@@ -226,6 +301,8 @@ function createWindow() {
     autoHideMenuBar: true,
     title: 'Messenger',
     icon: path.join(__dirname, 'build', 'icon.ico'),
+    // match the loading screen so there is no black/white flash before it paints
+    backgroundColor: LOADING_BG,
   });
 
   // Hide the menu bar completely
@@ -239,7 +316,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
     },
   });
+  view.setBackgroundColor(LOADING_BG);
   mainWindow.setBrowserView(view);
+  showLoading();
 
   if (isMaximized) {
     mainWindow.maximize();
@@ -296,7 +375,12 @@ function createWindow() {
 
   // Close the video dialog if the messenger view navigates away
   view.webContents.on('did-start-navigation', (details) => {
-    if (details.isMainFrame && !details.isSameDocument) closeVideoOverlay();
+    if (details.isMainFrame && !details.isSameDocument) {
+      closeVideoOverlay();
+      // Facebook sometimes switches chats with a full page reload instead of
+      // its in-page router - cover the slow reload with the loading screen
+      if (isMessengerPage(details.url)) showLoading();
+    }
   });
 
   // Safety net: if the FB SPA still navigates in-page to a media URL
@@ -347,6 +431,7 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    hideLoading();
     mainWindow = null;
     view = null;
   });
@@ -421,6 +506,7 @@ ipcMain.on('show-context-menu', (event, params) => {
     click: () => {
       if (view) {
         view.webContents.session.clearStorageData().then(() => {
+          showLoading();
           view.webContents.loadURL('https://www.facebook.com/messages');
         });
       }
@@ -444,12 +530,22 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(async () => {
-    // Clear leftover caches from previous runs (keeps cookies, so no re-login)
-    try {
-      await session.defaultSession.clearCache();
-      await session.defaultSession.clearCodeCaches({});
-    } catch {}
+    // Keeping the HTTP and code caches makes startup much faster (Facebook's
+    // JS doesn't have to be downloaded and compiled again). Only clear them
+    // if the previous run didn't exit cleanly, since that can leave a broken
+    // cache behind (keeps cookies, so no re-login)
+    if (!store.get('cleanExit')) {
+      try {
+        await session.defaultSession.clearCache();
+        await session.defaultSession.clearCodeCaches({});
+      } catch {}
+    }
+    store.set('cleanExit', false);
     createWindow();
+  });
+
+  app.on('will-quit', () => {
+    store.set('cleanExit', true);
   });
 
   app.on('window-all-closed', () => {

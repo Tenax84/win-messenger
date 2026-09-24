@@ -46,6 +46,50 @@ document.addEventListener(
   true
 );
 
+// Switch chats on mousedown instead of click: the SPA starts loading the
+// conversation ~0.1-0.2s earlier. The synthetic click goes through FB's own
+// router; the real click that follows on mouseup is swallowed so the chat
+// isn't opened twice.
+const CHAT_LINK_RE = /^\/messages\/(e2ee\/)?t\/[^/]+\/?$/;
+let pendingChatLink = null;
+
+document.addEventListener(
+  'mousedown',
+  (e) => {
+    pendingChatLink = null;
+    if (e.button !== 0 || e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;
+    const a = e.target.closest('a');
+    if (!a || !a.href) return;
+    // the row's "..." menu and other buttons inside the row keep normal behavior
+    const btn = e.target.closest('[role="button"], button');
+    if (btn && btn !== a && a.contains(btn)) return;
+    try {
+      const u = new URL(a.href);
+      if (!u.hostname.endsWith('facebook.com') || !CHAT_LINK_RE.test(u.pathname)) return;
+      if (u.pathname.replace(/\/$/, '') === location.pathname.replace(/\/$/, '')) return;
+    } catch {
+      return;
+    }
+    pendingChatLink = a;
+    a.click();
+  },
+  true
+);
+
+document.addEventListener(
+  'click',
+  (e) => {
+    if (!e.isTrusted || !pendingChatLink) return;
+    const a = pendingChatLink;
+    pendingChatLink = null;
+    if (a.contains(e.target)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  },
+  true
+);
+
 window.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   ipcRenderer.send('show-context-menu', {

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #18191a;
+    color: #b0b3b8;
+    font-family: 'Segoe UI', sans-serif;
+    overflow: hidden;
+    user-select: none;
+    cursor: default;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    transition: opacity 0.25s ease;
+  }
+  body.hide { opacity: 0; }
+  .logo { width: 84px; height: 84px; animation: pulse 1.6s ease-in-out infinite; }
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border: 3px solid #3a3b3c;
+    border-top-color: #0a7cff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  .text { font-size: 15px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 50% { transform: scale(0.94); opacity: 0.85; } }
+</style>
+</head>
+<body>
+  <svg class="logo" viewBox="0 0 100 100" aria-hidden="true">
+    <defs>
+      <linearGradient id="g" x1="0" y1="1" x2="1" y2="0">
+        <stop offset="0" stop-color="#0099ff"/>
+        <stop offset="0.6" stop-color="#a033ff"/>
+        <stop offset="1" stop-color="#ff5c87"/>
+      </linearGradient>
+    </defs>
+    <path fill="url(#g)" d="M50 6C25.2 6 6 24.2 6 48.8c0 12.9 5.3 24 13.9 31.7v15.2l14.2-7.8c5 1.4 10.3 2.1 15.9 2.1 24.8 0 44-18.2 44-42.8S74.8 6 50 6z"/>
+    <path fill="#fff" d="M23.6 61.2l13.9-22c2.2-3.5 7-4.4 10.3-1.9l11 8.3c1 .8 2.4.8 3.4 0l14.9-11.3c2-1.5 4.6.9 3.3 3l-13.9 22c-2.2 3.5-7 4.4-10.3 1.9l-11-8.3c-1-.8-2.4-.8-3.4 0L26.9 64.2c-2 1.5-4.6-.9-3.3-3z"/>
+  </svg>
+  <div class="spinner"></div>
+  <div class="text">Messenger betöltése…</div>
+</body>
+</html>
