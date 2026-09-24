@@ -41,6 +41,7 @@ Three source files, all at the repo root:
 
 - `open-media-dialog` — open the in-app media dialog for a URL
 - `close-video-overlay` — close the media dialog
+- `open-video-in-browser` — close the media dialog and open its current URL in the system browser
 - `show-context-menu` — build and show the native right-click menu (open/copy link, open/copy image, edit roles, and always a "Kijelentkezes" logout that clears session storage and reloads Messenger)
 
 ## Conventions

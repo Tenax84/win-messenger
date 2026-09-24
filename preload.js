@@ -1,6 +1,7 @@
 const { ipcRenderer } = require('electron');
 
 window.__closeVideoOverlay = () => ipcRenderer.send('close-video-overlay');
+window.__openVideoInBrowser = () => ipcRenderer.send('open-video-in-browser');
 
 // Facebook links (reel, watch, photo, ...) are rendered by the SPA in-page,
 // so no navigation event reaches the main process - the page would show the

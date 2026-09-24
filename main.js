@@ -17,6 +17,10 @@ let videoView;
 let videoViewVertical = false;
 let lastUnreadCount = 0;
 
+// Facebook may serve some pages (e.g. logged-in reels) as a blank white page to
+// non-Chrome user agents - drop the "Electron/x" token so it looks like Chrome
+const CHROME_UA = (ua) => ua.replace(/\s(Electron|messenger)\/\S+/gi, '');
+
 // Links in chat messages go through Facebook's link shim
 // (l.facebook.com/l.php?u=<target>) - unwrap to get the real destination
 function unwrapLinkShim(url) {
@@ -105,6 +109,14 @@ const BACKDROP_JS = `
   c.title = 'Bezaras (Esc)';
   c.style.cssText = 'position:fixed;top:${BANNER_HEIGHT + 12}px;right:18px;font-size:26px;line-height:1;color:#fff;font-family:sans-serif;';
   d.appendChild(c);
+  const b = document.createElement('div');
+  b.textContent = 'Megnyitas bongeszoben';
+  b.style.cssText = 'position:fixed;top:${BANNER_HEIGHT + 16}px;right:60px;font-size:15px;color:#fff;font-family:sans-serif;text-decoration:underline;';
+  b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    window.__openVideoInBrowser && window.__openVideoInBrowser();
+  });
+  d.appendChild(b);
   d.addEventListener('click', () => window.__closeVideoOverlay && window.__closeVideoOverlay());
   document.body.appendChild(d);
 })();
@@ -135,6 +147,24 @@ function openVideoWindow(url) {
         nodeIntegration: false,
         contextIsolation: true,
       },
+    });
+    videoView.setBackgroundColor('#000000');
+    videoView.webContents.setUserAgent(CHROME_UA(videoView.webContents.getUserAgent()));
+
+    // If the media page can't be shown, fall back to the default browser
+    const fallbackToBrowser = () => {
+      if (!videoView) return;
+      const current = videoView.webContents.getURL() || url;
+      setImmediate(closeVideoOverlay);
+      shell.openExternal(current);
+    };
+    videoView.webContents.on('render-process-gone', (event, details) => {
+      // 'killed' / 'clean-exit' happen when the dialog itself is closed
+      if (details.reason !== 'killed' && details.reason !== 'clean-exit') fallbackToBrowser();
+    });
+    videoView.webContents.on('did-fail-load', (event, code, desc, failedUrl, isMainFrame) => {
+      // -3 = ERR_ABORTED (redirects, cancelled loads) is not a real failure
+      if (isMainFrame && code !== -3) fallbackToBrowser();
     });
 
     // Links opened from the video dialog go to the default browser
@@ -323,6 +353,13 @@ function createWindow() {
 }
 
 ipcMain.on('close-video-overlay', closeVideoOverlay);
+
+ipcMain.on('open-video-in-browser', () => {
+  if (!videoView) return;
+  const url = videoView.webContents.getURL();
+  closeVideoOverlay();
+  if (url) shell.openExternal(url);
+});
 
 ipcMain.on('open-media-dialog', (event, url) => openVideoWindow(unwrapLinkShim(url)));
 
