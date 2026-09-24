@@ -264,6 +264,27 @@ function isMessengerPage(url) {
   }
 }
 
+// Messenger links that point at a conversation, e.g. when Facebook's
+// notification click handler calls window.open() - load them in the app
+// instead of the default browser
+function toAppMessengerUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.endsWith('messenger.com') && u.pathname.startsWith('/t/')) {
+      return `https://www.facebook.com/messages${u.pathname}`;
+    }
+  } catch {}
+  return url;
+}
+
+function focusMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  if (view && !view.webContents.isDestroyed()) view.webContents.focus();
+}
+
 function updateViewBounds() {
   if (!mainWindow || !view) return;
   const [width, height] = mainWindow.getContentSize();
@@ -334,7 +355,10 @@ function createWindow() {
   // Video and photo links open in an in-app dialog, everything else in default browser
   view.webContents.setWindowOpenHandler(({ url }) => {
     const target = unwrapLinkShim(url);
-    if (isVideoUrl(target) || isPhotoUrl(target)) {
+    if (isMessengerPage(target)) {
+      focusMainWindow();
+      view.webContents.loadURL(toAppMessengerUrl(target));
+    } else if (isVideoUrl(target) || isPhotoUrl(target)) {
       openVideoWindow(target);
     } else {
       shell.openExternal(url);
@@ -446,6 +470,8 @@ ipcMain.on('open-video-in-browser', () => {
   if (url) shell.openExternal(url);
 });
 
+ipcMain.on('focus-main-window', focusMainWindow);
+
 ipcMain.on('open-media-dialog', (event, url) => openVideoWindow(unwrapLinkShim(url)));
 
 ipcMain.on('show-context-menu', (event, params) => {
@@ -522,12 +548,9 @@ ipcMain.on('show-context-menu', (event, params) => {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
-  });
+  // Windows may also start the app again when an older notification is
+  // clicked in the Action Center - just bring the existing window forward
+  app.on('second-instance', focusMainWindow);
 
   app.whenReady().then(async () => {
     // Keeping the HTTP and code caches makes startup much faster (Facebook's

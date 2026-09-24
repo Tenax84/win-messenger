@@ -90,6 +90,60 @@ document.addEventListener(
   true
 );
 
+// Notifications: Facebook's click handler opens the conversation with
+// window.open(), which would end up in the default browser. Bring the app
+// window to the front and open the conversation in the app instead.
+const MESSENGER_THREAD_RE = /^\/(messages\/)?(e2ee\/)?t\//;
+
+function toAppThreadUrl(href) {
+  try {
+    const u = new URL(href, location.href);
+    if (u.hostname.endsWith('messenger.com') && MESSENGER_THREAD_RE.test(u.pathname)) {
+      return new URL(`/messages${u.pathname}`, 'https://www.facebook.com');
+    }
+    if (u.hostname.endsWith('facebook.com') && u.pathname.startsWith('/messages')) return u;
+  } catch {}
+  return null;
+}
+
+// Prefer the chat list link (FB's in-page router, no reload), fall back to
+// a normal navigation
+function openThreadInApp(u) {
+  const path = u.pathname.replace(/\/$/, '');
+  if (path === location.pathname.replace(/\/$/, '')) return;
+  const link = Array.from(document.querySelectorAll('a[href*="/t/"]')).find((a) => {
+    try {
+      return new URL(a.href).pathname.replace(/\/$/, '') === path;
+    } catch {
+      return false;
+    }
+  });
+  if (link) link.click();
+  else location.assign(u.href);
+}
+
+const nativeOpen = window.open;
+window.open = function (url, ...rest) {
+  const u = url && toAppThreadUrl(String(url));
+  if (u) {
+    ipcRenderer.send('focus-main-window');
+    openThreadInApp(u);
+    return window;
+  }
+  return nativeOpen.call(window, url, ...rest);
+};
+
+const NativeNotification = window.Notification;
+if (NativeNotification) {
+  window.Notification = class extends NativeNotification {
+    constructor(...args) {
+      super(...args);
+      // registered before FB's own onclick, so it runs first
+      this.addEventListener('click', () => ipcRenderer.send('focus-main-window'));
+    }
+  };
+}
+
 window.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   ipcRenderer.send('show-context-menu', {
