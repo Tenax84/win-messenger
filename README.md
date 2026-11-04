@@ -7,6 +7,7 @@ A lightweight Electron wrapper that runs Facebook Messenger as a standalone desk
 - **Clean UI** - No browser chrome, address bar, or Facebook navigation banner
 - **Window state persistence** - Remembers position, size, and monitor across restarts
 - **External link handling** - Clicked links open in your default browser instead of inside the app
+- **Fast image viewer** - Photos sent in chat open in a built-in viewer showing the direct full-resolution image (zoom, pan, save, copy), instead of Facebook's slow photo page; page between the chat's photos with the arrow keys
 - **Right-click context menu** - Copy, paste, open links, copy URLs, and logout
 - **Session management** - Logout option available via right-click menu (clears all session data)
 

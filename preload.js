@@ -21,6 +21,113 @@ function isMediaPath(p) {
   );
 }
 
+// Photo pages open in the app's own image viewer (main.js); the image shown
+// in the chat is passed along so the viewer can show it instantly while the
+// full resolution version is being looked up
+function isPhotoViewerPath(p) {
+  return p.startsWith('/messenger_media') || p.startsWith('/photo');
+}
+
+function findThumbnail(a, target) {
+  const imgs = target && target.tagName === 'IMG' ? [target] : [];
+  imgs.push(...a.querySelectorAll('img'));
+  let best = null;
+  let bestArea = 0;
+  for (const img of imgs) {
+    const src = img.currentSrc || img.src;
+    if (!src) continue;
+    const area = (img.naturalWidth || img.width) * (img.naturalHeight || img.height);
+    if (area > bestArea) {
+      best = src;
+      bestArea = area;
+    }
+  }
+  return best;
+}
+
+// Encrypted chats show decrypted images as blob: URLs, which only work in this
+// page - hand them to the viewer as data: URLs instead
+function blobToDataUrl(url) {
+  return fetch(url)
+    .then((r) => r.blob())
+    .then(
+      (blob) =>
+        new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        })
+    )
+    .catch(() => null);
+}
+
+// The photo page a chat link points to (shim unwrapped), or null
+function photoHref(a) {
+  try {
+    let u = new URL(a.href);
+    if (u.hostname.endsWith('facebook.com') && u.pathname === '/l.php') {
+      const target = u.searchParams.get('u');
+      if (target) u = new URL(target);
+    }
+    if (u.hostname.endsWith('facebook.com') && isPhotoViewerPath(u.pathname)) return u.href;
+  } catch {}
+  return null;
+}
+
+// All photos of the open conversation currently on the page (Messenger only
+// keeps the loaded part of the history in the DOM), oldest first, so the
+// viewer can page between them
+function collectGallery(href, a, target) {
+  const root = a.closest('[role="main"]') || document;
+  const items = [];
+  const seen = new Set();
+  for (const link of root.querySelectorAll('a[href]')) {
+    const url = link === a ? href : photoHref(link);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    items.push({ url, thumb: findThumbnail(link, link === a ? target : null) });
+  }
+  let index = items.findIndex((it) => it.url === href);
+  if (index < 0) {
+    items.length = 0;
+    items.push({ url: href, thumb: findThumbnail(a, target) });
+    index = 0;
+  }
+  return { items, index };
+}
+
+function openPhoto(href, a, target) {
+  const { items, index } = collectGallery(href, a, target);
+  // blob: thumbnails (encrypted chats) only work in this page: the clicked
+  // one is converted before opening, the rest are sent along afterwards
+  const blobs = [];
+  for (const [i, it] of items.entries()) {
+    if (i !== index && it.thumb && it.thumb.startsWith('blob:')) {
+      blobs.push({ url: it.url, blob: it.thumb });
+      it.thumb = null;
+    }
+  }
+  const sendRest = () => {
+    for (const b of blobs) {
+      blobToDataUrl(b.blob).then((data) => {
+        if (data) ipcRenderer.send('photo-gallery-thumb', b.url, data);
+      });
+    }
+  };
+  const clicked = items[index];
+  if (clicked.thumb && clicked.thumb.startsWith('blob:')) {
+    blobToDataUrl(clicked.thumb).then((data) => {
+      clicked.thumb = data;
+      ipcRenderer.send('open-photo-gallery', items, index);
+      sendRest();
+    });
+  } else {
+    ipcRenderer.send('open-photo-gallery', items, index);
+    sendRest();
+  }
+}
+
 document.addEventListener(
   'click',
   (e) => {
@@ -39,7 +146,8 @@ document.addEventListener(
       if (isMedia) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        ipcRenderer.send('open-media-dialog', u.href);
+        if (isPhotoViewerPath(u.pathname)) openPhoto(u.href, a, e.target);
+        else ipcRenderer.send('open-media-dialog', u.href);
       }
     } catch {}
   },

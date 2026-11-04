@@ -1,4 +1,4 @@
-const { app, BrowserWindow, BrowserView, screen, shell, ipcMain, Menu, session } = require('electron');
+const { app, BrowserWindow, BrowserView, screen, shell, ipcMain, Menu, session, clipboard } = require('electron');
 const path = require('path');
 const Store = require('electron-store').default;
 
@@ -73,6 +73,32 @@ function isPhotoUrl(url) {
   }
 }
 
+// A link that points straight at an image file, e.g. an fbcdn.net photo
+function isDirectImageUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      /\.(jpe?g|png|gif|webp|avif|bmp)$/i.test(parsed.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Photos shown in the in-app image viewer instead of Facebook's (slow) photo
+// viewer page: chat attachments, photo pages and direct image links
+function isImageViewerUrl(url) {
+  if (isDirectImageUrl(url)) return true;
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname.endsWith('facebook.com')) return false;
+    return parsed.pathname.startsWith('/messenger_media') || parsed.pathname.startsWith('/photo');
+  } catch {
+    return false;
+  }
+}
+
 function isVerticalVideoUrl(url) {
   try {
     const parsed = new URL(url);
@@ -140,6 +166,7 @@ function closeVideoOverlay() {
 
 function openVideoWindow(url) {
   if (!mainWindow || !view) return;
+  closeImageViewer();
   videoViewVertical = isVerticalVideoUrl(url);
 
   if (!videoView) {
@@ -190,6 +217,440 @@ function openVideoWindow(url) {
   videoView.webContents.loadURL(url);
   videoView.webContents.focus();
 }
+
+// ---------------------------------------------------------------------------
+// In-app image viewer
+//
+// Facebook's photo viewer (/messenger_media, /photo) is slow, so photos are
+// shown in our own viewer (viewer.html) instead. It shows the chat thumbnail
+// right away, while a hidden window loads Facebook's viewer page just to read
+// the full resolution fbcdn.net image URL out of it; once found, the viewer
+// swaps the thumbnail for it.
+// ---------------------------------------------------------------------------
+
+let imageView = null;
+// The photos of the chat the viewer pages through: [{ url, thumb }]
+let gallery = null; // { items, index }
+let current = null; // { item, shownUrl, resolver, initial }
+let prefetch = null; // resolver looking up a neighbouring photo in advance
+let lastDir = 1; // paging direction, the next photo that way is prefetched
+const hiResCache = new Map(); // viewer page URL -> full resolution image URL
+const videoPages = new Set(); // viewer page URLs that turned out to be videos
+const HIRES_TIMEOUT_MS = 20000;
+const HIRES_SETTLE_MS = 1500;
+
+// Runs in the hidden Facebook viewer page: the largest fbcdn image is the photo
+// (profile pictures and icons are small). Reports videos so they can go to
+// the regular media dialog instead.
+const FIND_IMAGE_JS = `
+(() => {
+  let best = null;
+  for (const img of document.images) {
+    const src = img.currentSrc || img.src;
+    if (!/^https:\\/\\/[^/]*fbcdn\\.net\\//.test(src)) continue;
+    const r = img.getBoundingClientRect();
+    const area = img.naturalWidth ? img.naturalWidth * img.naturalHeight : r.width * r.height;
+    if (area < 250 * 250) continue;
+    if (!best || area > best.area) best = { src, area };
+  }
+  const video = !!document.querySelector('video');
+  return { best, video };
+})()
+`;
+
+function isHttpUrl(url) {
+  return /^https?:\/\//i.test(url || '');
+}
+
+// The best URL to hand to the browser / clipboard for the shown image
+function viewerLinkUrl() {
+  if (!current) return null;
+  return isHttpUrl(current.shownUrl) ? current.shownUrl : current.item.url;
+}
+
+function sendToViewer(channel, ...args) {
+  if (imageView && !imageView.webContents.isDestroyed()) {
+    imageView.webContents.send(channel, ...args);
+  }
+}
+
+function stopResolver(r) {
+  if (!r || r.done) return;
+  r.done = true;
+  clearInterval(r.poll);
+  clearTimeout(r.timeout);
+  if (!r.win.isDestroyed()) r.win.destroy();
+}
+
+// Loads a Facebook photo page in a hidden window and reads the full resolution
+// image URL out of it. handlers: onImage(src) for every better version found,
+// onDone('found' | 'video' | 'failed'). The handlers can be swapped while it
+// runs (a prefetch taken over by the viewer).
+function createResolver(pageUrl, handlers) {
+  const win = new BrowserWindow({
+    show: false,
+    width: 2048,
+    height: 1536,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      backgroundThrottling: false,
+    },
+  });
+  win.webContents.setAudioMuted(true);
+  win.webContents.setUserAgent(CHROME_UA(win.webContents.getUserAgent()));
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  const r = { pageUrl, win, handlers, best: null, lastUpgrade: 0, done: false };
+
+  const finish = (result) => {
+    if (r.done) return;
+    stopResolver(r);
+    if (r.handlers.onDone) r.handlers.onDone(result);
+  };
+
+  r.poll = setInterval(async () => {
+    if (r.done || win.isDestroyed()) return;
+    let result;
+    try {
+      result = await win.webContents.executeJavaScript(FIND_IMAGE_JS);
+    } catch {
+      return;
+    }
+    if (r.done || !result) return;
+    const { best, video } = result;
+    if (video && !r.best) {
+      videoPages.add(pageUrl);
+      finish('video');
+      return;
+    }
+    if (best && (!r.best || best.area > r.best.area)) {
+      r.best = best;
+      r.lastUpgrade = Date.now();
+      hiResCache.set(pageUrl, best.src);
+      if (r.handlers.onImage) r.handlers.onImage(best.src);
+    }
+    // Facebook may swap in a larger version shortly after the first one -
+    // stop once the image hasn't changed for a while
+    if (r.best && Date.now() - r.lastUpgrade > HIRES_SETTLE_MS) finish('found');
+  }, 250);
+  r.timeout = setTimeout(() => finish(r.best ? 'found' : 'failed'), HIRES_TIMEOUT_MS);
+
+  win.webContents.on('did-fail-load', (event, code, desc, failedUrl, isMainFrame) => {
+    if (isMainFrame && code !== -3) finish(r.best ? 'found' : 'failed');
+  });
+
+  win.loadURL(pageUrl);
+  return r;
+}
+
+function stopPrefetch() {
+  stopResolver(prefetch);
+  prefetch = null;
+}
+
+// Look up a neighbouring photo (in the paging direction first) in advance, so
+// paging to it shows the full resolution image right away. Only one runs at a
+// time, and only while the current photo isn't being looked up.
+function startPrefetch() {
+  if (!gallery || !current || current.resolver || (prefetch && !prefetch.done)) return;
+  for (const step of [lastDir, -lastDir]) {
+    const item = gallery.items[gallery.index + step];
+    if (!item || isDirectImageUrl(item.url) || hiResCache.has(item.url) || videoPages.has(item.url)) continue;
+    const r = createResolver(item.url, {
+      onDone: () => {
+        if (prefetch !== r) return;
+        prefetch = null;
+        startPrefetch();
+      },
+    });
+    prefetch = r;
+    return;
+  }
+}
+
+function openCurrentAsVideo() {
+  if (!current) return;
+  const url = current.item.url;
+  closeImageViewer();
+  openVideoWindow(url);
+}
+
+// The photo turned out to be a video: the clicked one plays in the media
+// dialog right away, one reached by paging offers a play button instead
+function handleVideo(state) {
+  if (state.initial) openCurrentAsVideo();
+  else sendToViewer('viewer:status', 'video');
+}
+
+function showGalleryItem(index, initial) {
+  if (!gallery || !gallery.items[index]) return;
+  if (current) stopResolver(current.resolver);
+  gallery.index = index;
+  const item = gallery.items[index];
+  const url = item.url;
+  const state = { item, shownUrl: null, resolver: null, initial };
+  current = state;
+  if (prefetch && prefetch.pageUrl !== url) stopPrefetch();
+
+  sendToViewer('viewer:reset', { index, total: gallery.items.length });
+
+  if (isDirectImageUrl(url)) {
+    sendToViewer('viewer:image', url, 'full');
+    startPrefetch();
+    return;
+  }
+  if (videoPages.has(url)) {
+    if (item.thumb) sendToViewer('viewer:image', item.thumb, 'preview');
+    handleVideo(state);
+    return;
+  }
+
+  const handlers = {
+    onImage: (src) => {
+      if (current === state) sendToViewer('viewer:image', src, 'full');
+    },
+    onDone: (result) => {
+      if (current !== state) return;
+      state.resolver = null;
+      if (result === 'video') {
+        handleVideo(state);
+        return;
+      }
+      if (result === 'found') {
+        sendToViewer('viewer:status', 'done');
+      } else if (!item.thumb && state.initial) {
+        // nothing to show at all - use Facebook's own viewer in the media dialog
+        openCurrentAsVideo();
+        return;
+      } else {
+        sendToViewer('viewer:status', 'failed');
+      }
+      startPrefetch();
+    },
+  };
+
+  const cached = hiResCache.get(url);
+  if (cached) sendToViewer('viewer:image', cached, 'full');
+  else if (item.thumb) sendToViewer('viewer:image', item.thumb, 'preview');
+
+  if (prefetch && prefetch.pageUrl === url && !prefetch.done) {
+    // already being looked up in advance - take it over
+    state.resolver = prefetch;
+    prefetch = null;
+    state.resolver.handlers = handlers;
+    sendToViewer('viewer:status', 'loading');
+  } else if (cached) {
+    sendToViewer('viewer:status', 'done');
+    startPrefetch();
+  } else {
+    sendToViewer('viewer:status', 'loading');
+    state.resolver = createResolver(url, handlers);
+  }
+}
+
+function closeImageViewer() {
+  if (current) stopResolver(current.resolver);
+  current = null;
+  gallery = null;
+  stopPrefetch();
+  if (!imageView) return;
+  const iv = imageView;
+  imageView = null;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.removeBrowserView(iv);
+  if (!iv.webContents.isDestroyed()) iv.webContents.destroy();
+  if (view && !view.webContents.isDestroyed()) view.webContents.focus();
+}
+
+function updateImageViewBounds() {
+  if (!mainWindow || !imageView) return;
+  const [width, height] = mainWindow.getContentSize();
+  imageView.setBounds({ x: 0, y: 0, width, height });
+}
+
+// items: [{ url, thumb }] - url: Facebook photo page or direct image URL,
+// thumb: the image shown in the chat (https or data: URL), if known.
+// index: the clicked one; the viewer can page to the others.
+function openImageViewer(items, index) {
+  if (!mainWindow || !view || !items.length) return;
+  closeVideoOverlay();
+  closeImageViewer();
+
+  const g = { items, index };
+  gallery = g;
+  lastDir = 1;
+
+  imageView = new BrowserView({
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      preload: path.join(__dirname, 'viewer-preload.js'),
+    },
+  });
+  imageView.setBackgroundColor('#0e0f10');
+  mainWindow.addBrowserView(imageView);
+  updateImageViewBounds();
+
+  const wc = imageView.webContents;
+  wc.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  // Esc closes the viewer even if the page hasn't loaded yet
+  wc.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'Escape') {
+      event.preventDefault();
+      closeImageViewer();
+    }
+  });
+
+  wc.once('did-finish-load', () => {
+    if (gallery === g) showGalleryItem(g.index, true);
+  });
+
+  wc.loadFile(path.join(__dirname, 'viewer.html'));
+  wc.focus();
+}
+
+// Photos go to the image viewer, everything else (videos, posts) to the
+// media dialog
+function openMedia(url, thumbUrl) {
+  if (isImageViewerUrl(url)) openImageViewer([{ url, thumb: thumbUrl || null }], 0);
+  else openVideoWindow(url);
+}
+
+function isFromViewer(event) {
+  return imageView && !imageView.webContents.isDestroyed() && event.sender === imageView.webContents;
+}
+
+ipcMain.on('viewer:shown', (event, url) => {
+  if (isFromViewer(event) && current) current.shownUrl = url;
+});
+
+ipcMain.on('viewer:navigate', (event, step) => {
+  if (!isFromViewer(event) || !gallery || (step !== 1 && step !== -1)) return;
+  const index = gallery.index + step;
+  if (index < 0 || index >= gallery.items.length) return;
+  lastDir = step;
+  showGalleryItem(index, false);
+});
+
+ipcMain.on('viewer:play-video', (event) => {
+  if (isFromViewer(event)) openCurrentAsVideo();
+});
+
+ipcMain.on('viewer:close', (event) => {
+  if (isFromViewer(event)) closeImageViewer();
+});
+
+ipcMain.on('viewer:open-browser', (event) => {
+  if (!isFromViewer(event)) return;
+  const url = viewerLinkUrl();
+  closeImageViewer();
+  if (url) shell.openExternal(url);
+});
+
+ipcMain.on('viewer:copy-link', (event) => {
+  if (!isFromViewer(event)) return;
+  const url = viewerLinkUrl();
+  if (url) clipboard.writeText(url);
+});
+
+ipcMain.on('viewer:save', (event) => {
+  if (!isFromViewer(event) || !current) return;
+  const url = current.shownUrl;
+  if (url) imageView.webContents.downloadURL(url);
+});
+
+ipcMain.on('viewer:copy-image', (event, x, y) => {
+  if (isFromViewer(event)) imageView.webContents.copyImageAt(x, y);
+});
+
+ipcMain.on('viewer:context-menu', (event, x, y, onImage) => {
+  if (!isFromViewer(event) || !current) return;
+  const wc = imageView.webContents;
+  const items = [];
+  if (onImage && current.shownUrl) {
+    items.push({ label: 'Kép másolása', click: () => wc.copyImageAt(x, y) });
+  }
+  items.push({
+    label: 'Link másolása',
+    click: () => {
+      const url = viewerLinkUrl();
+      if (url) clipboard.writeText(url);
+    },
+  });
+  const shownUrl = current.shownUrl;
+  if (shownUrl) {
+    items.push({ label: 'Mentés másként…', click: () => wc.downloadURL(shownUrl) });
+  }
+  if (gallery && gallery.items.length > 1) {
+    items.push({ type: 'separator' });
+    items.push({
+      label: 'Előző kép',
+      enabled: gallery.index > 0,
+      click: () => {
+        lastDir = -1;
+        showGalleryItem(gallery.index - 1, false);
+      },
+    });
+    items.push({
+      label: 'Következő kép',
+      enabled: gallery.index < gallery.items.length - 1,
+      click: () => {
+        lastDir = 1;
+        showGalleryItem(gallery.index + 1, false);
+      },
+    });
+    items.push({ type: 'separator' });
+  }
+  items.push({
+    label: 'Megnyitás böngészőben',
+    click: () => {
+      const url = viewerLinkUrl();
+      closeImageViewer();
+      if (url) shell.openExternal(url);
+    },
+  });
+  items.push({ type: 'separator' });
+  items.push({ label: 'Bezárás', click: closeImageViewer });
+  Menu.buildFromTemplate(items).popup({ window: mainWindow });
+});
+
+// Photo click in the chat (preload.js): the clicked photo plus all photos of
+// the chat currently loaded on the page, for paging
+function sanitizeThumb(thumb) {
+  return typeof thumb === 'string' && /^(https:|data:image\/)/.test(thumb) ? thumb : null;
+}
+
+ipcMain.on('open-photo-gallery', (event, items, index) => {
+  if (!Array.isArray(items)) return;
+  const clean = [];
+  let cleanIndex = 0;
+  items.forEach((it, i) => {
+    if (!it || typeof it.url !== 'string') return;
+    const url = unwrapLinkShim(it.url);
+    if (!isImageViewerUrl(url)) return;
+    if (i === index) cleanIndex = clean.length;
+    clean.push({ url, thumb: sanitizeThumb(it.thumb) });
+  });
+  if (!clean.length) return;
+  openImageViewer(clean, cleanIndex);
+});
+
+// Thumbnails of encrypted chats arrive later (converted from blob: URLs)
+ipcMain.on('photo-gallery-thumb', (event, url, thumb) => {
+  thumb = sanitizeThumb(thumb);
+  if (!gallery || !thumb) return;
+  for (const item of gallery.items) {
+    if (item.url !== url || item.thumb) continue;
+    item.thumb = thumb;
+    if (current && current.item === item && !current.shownUrl) {
+      sendToViewer('viewer:image', thumb, 'preview');
+    }
+  }
+});
 
 // Facebook first paints a placeholder skeleton (fake sidebar, empty chat) and
 // only fills in the real chats later - cover the messenger view with a loading
@@ -291,6 +752,7 @@ function updateViewBounds() {
   view.setBounds({ x: 0, y: -BANNER_HEIGHT, width, height: height + BANNER_HEIGHT });
   if (loadingView) loadingView.setBounds({ x: 0, y: 0, width, height });
   updateVideoViewBounds();
+  updateImageViewBounds();
 }
 
 function createWindow() {
@@ -359,7 +821,7 @@ function createWindow() {
       focusMainWindow();
       view.webContents.loadURL(toAppMessengerUrl(target));
     } else if (isVideoUrl(target) || isPhotoUrl(target)) {
-      openVideoWindow(target);
+      openMedia(target);
     } else {
       shell.openExternal(url);
     }
@@ -387,7 +849,7 @@ function createWindow() {
         event.preventDefault();
         const target = unwrapLinkShim(url);
         if (isVideoUrl(target) || isPhotoUrl(target)) {
-          openVideoWindow(target);
+          openMedia(target);
         } else {
           shell.openExternal(url);
         }
@@ -401,6 +863,7 @@ function createWindow() {
   view.webContents.on('did-start-navigation', (details) => {
     if (details.isMainFrame && !details.isSameDocument) {
       closeVideoOverlay();
+      closeImageViewer();
       // Facebook sometimes switches chats with a full page reload instead of
       // its in-page router - cover the slow reload with the loading screen
       if (isMessengerPage(details.url)) showLoading();
@@ -415,7 +878,7 @@ function createWindow() {
     const target = unwrapLinkShim(url);
     if (isVideoUrl(target) || isPhotoUrl(target)) {
       if (view.webContents.canGoBack()) view.webContents.goBack();
-      openVideoWindow(target);
+      openMedia(target);
     }
   });
 
@@ -456,6 +919,8 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     hideLoading();
+    // the hidden image resolver window would otherwise keep the app alive
+    closeImageViewer();
     mainWindow = null;
     view = null;
   });
@@ -472,7 +937,13 @@ ipcMain.on('open-video-in-browser', () => {
 
 ipcMain.on('focus-main-window', focusMainWindow);
 
-ipcMain.on('open-media-dialog', (event, url) => openVideoWindow(unwrapLinkShim(url)));
+// thumbUrl: the image the user clicked in the chat, shown until the full
+// resolution version is found
+ipcMain.on('open-media-dialog', (event, url, thumbUrl) => {
+  const target = unwrapLinkShim(url);
+  const thumb = typeof thumbUrl === 'string' && /^(https:|data:image\/)/.test(thumbUrl) ? thumbUrl : null;
+  openMedia(target, thumb);
+});
 
 ipcMain.on('show-context-menu', (event, params) => {
   const menuItems = [];
@@ -484,7 +955,7 @@ ipcMain.on('show-context-menu', (event, params) => {
     });
     menuItems.push({
       label: 'Link masolasa',
-      click: () => require('electron').clipboard.writeText(params.linkURL),
+      click: () => clipboard.writeText(params.linkURL),
     });
     menuItems.push({ type: 'separator' });
   }
@@ -496,7 +967,7 @@ ipcMain.on('show-context-menu', (event, params) => {
     });
     menuItems.push({
       label: 'Kep URL masolasa',
-      click: () => require('electron').clipboard.writeText(params.srcURL),
+      click: () => clipboard.writeText(params.srcURL),
     });
     menuItems.push({ type: 'separator' });
   }

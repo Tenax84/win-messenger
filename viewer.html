@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0e0f10;
+    color: #e4e6eb;
+    font-family: 'Segoe UI', sans-serif;
+    overflow: hidden;
+    user-select: none;
+  }
+  #stage { position: fixed; inset: 0; cursor: zoom-out; }
+  #img {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
+    cursor: grab;
+    display: none;
+    -webkit-user-drag: none;
+    image-rendering: auto;
+  }
+  #img.dragging { cursor: grabbing; }
+  .toolbar {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    gap: 6px;
+    z-index: 2;
+  }
+  .toolbar button {
+    background: rgba(58, 59, 60, 0.85);
+    color: #e4e6eb;
+    border: 0;
+    border-radius: 18px;
+    height: 36px;
+    padding: 0 14px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .toolbar button:hover { background: rgba(78, 79, 80, 0.95); }
+  .toolbar button.icon { width: 36px; padding: 0; font-size: 18px; }
+  .status {
+    position: fixed;
+    left: 14px;
+    bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #b0b3b8;
+    background: rgba(24, 25, 26, 0.75);
+    padding: 6px 10px;
+    border-radius: 14px;
+    z-index: 2;
+    transition: opacity 0.2s;
+  }
+  .status.hidden { opacity: 0; pointer-events: none; }
+  .spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid #3a3b3c;
+    border-top-color: #0a7cff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  .status.idle .spinner { display: none; }
+  .zoom {
+    position: fixed;
+    right: 14px;
+    bottom: 12px;
+    font-size: 13px;
+    color: #b0b3b8;
+    background: rgba(24, 25, 26, 0.75);
+    padding: 6px 10px;
+    border-radius: 14px;
+    z-index: 2;
+  }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: rgba(58, 59, 60, 0.95);
+    padding: 8px 16px;
+    border-radius: 16px;
+    font-size: 14px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+    z-index: 3;
+  }
+  .toast.show { opacity: 1; }
+  .empty {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .empty .spinner { width: 28px; height: 28px; border-width: 3px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .nav {
+    position: fixed;
+    top: 50%;
+    width: 48px;
+    height: 48px;
+    margin-top: -24px;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(58, 59, 60, 0.85);
+    color: #e4e6eb;
+    font-size: 26px;
+    line-height: 48px;
+    text-align: center;
+    padding: 0;
+    cursor: pointer;
+    z-index: 2;
+  }
+  .nav:hover { background: rgba(78, 79, 80, 0.95); }
+  .nav.hidden { display: none; }
+  #prev { left: 16px; }
+  #next { right: 16px; }
+  .counter {
+    position: fixed;
+    top: 12px;
+    left: 14px;
+    height: 36px;
+    line-height: 36px;
+    padding: 0 14px;
+    font-size: 14px;
+    color: #e4e6eb;
+    background: rgba(24, 25, 26, 0.75);
+    border-radius: 18px;
+    z-index: 2;
+  }
+  .counter.hidden { display: none; }
+  .play {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    display: none;
+    align-items: center;
+    gap: 10px;
+    border: 0;
+    border-radius: 28px;
+    height: 56px;
+    padding: 0 24px;
+    background: rgba(10, 124, 255, 0.92);
+    color: #fff;
+    font: inherit;
+    font-size: 16px;
+    cursor: pointer;
+    z-index: 2;
+  }
+  .play:hover { background: rgba(10, 124, 255, 1); }
+  .play.show { display: flex; }
+</style>
+</head>
+<body>
+  <div id="stage"><img id="img" alt=""></div>
+  <div class="empty" id="empty"><div class="spinner"></div></div>
+  <div class="counter hidden" id="counter"></div>
+  <div class="toolbar">
+    <button id="btnSave" title="Mentés másként (Ctrl+S)">Mentés</button>
+    <button id="btnCopy" title="Kép linkjének másolása">Link másolása</button>
+    <button id="btnBrowser" title="Kép megnyitása böngészőben">Megnyitás böngészőben</button>
+    <button id="btnClose" class="icon" title="Bezárás (Esc)">&#x2715;</button>
+  </div>
+  <button class="nav hidden" id="prev" title="Előző kép (←)">&#x2039;</button>
+  <button class="nav hidden" id="next" title="Következő kép (→)">&#x203A;</button>
+  <button class="play" id="play" title="Videó lejátszása (Enter)">&#x25B6; Videó lejátszása</button>
+  <div class="status hidden" id="status"><div class="spinner"></div><span id="statusText"></span></div>
+  <div class="zoom" id="zoom"></div>
+  <div class="toast" id="toast"></div>
+<script>
+(() => {
+  const stage = document.getElementById('stage');
+  const img = document.getElementById('img');
+  const empty = document.getElementById('empty');
+  const statusEl = document.getElementById('status');
+  const statusText = document.getElementById('statusText');
+  const zoomEl = document.getElementById('zoom');
+  const toastEl = document.getElementById('toast');
+  const counterEl = document.getElementById('counter');
+  const prevBtn = document.getElementById('prev');
+  const nextBtn = document.getElementById('next');
+  const playBtn = document.getElementById('play');
+
+  const MARGIN = 24;
+  const SAME_ASPECT = 0.03;     // relative aspect ratio difference still "the same"
+  let natW = 0, natH = 0;       // natural size of the shown image
+  let scale = 1, tx = 0, ty = 0;
+  let userZoomed = false;       // once the user zooms/pans, keep their view on resize
+  let shownUrl = null;
+  let shownKind = null;         // 'preview' (chat thumbnail) or 'full'
+  let pendingFull = null;       // full resolution image being loaded
+  let allowUpscale = false;     // a thumbnail is fitted to the window like the full image will be
+  let gen = 0;                  // bumped per gallery photo, drops late loads of the previous one
+  let fresh = true;             // the shown image (if any) belongs to the previous photo
+  let hideTimer = null;
+  let index = 0, total = 1;
+  let isVideo = false;
+
+  function fitScale() {
+    const w = window.innerWidth - MARGIN * 2;
+    const h = window.innerHeight - MARGIN * 2;
+    return Math.min(w / natW, h / natH, allowUpscale ? Infinity : 1);
+  }
+
+  function apply() {
+    img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    if (!natW || shownKind !== 'full') zoomEl.textContent = '';
+    else zoomEl.textContent = `${natW} × ${natH} · ${Math.round(scale * 100)}%`;
+    zoomEl.style.display = zoomEl.textContent ? '' : 'none';
+  }
+
+  function fit() {
+    if (!natW) return;
+    scale = fitScale();
+    tx = (window.innerWidth - natW * scale) / 2;
+    ty = (window.innerHeight - natH * scale) / 2;
+    userZoomed = false;
+    apply();
+  }
+
+  function zoomAt(newScale, cx, cy) {
+    if (!natW) return;
+    const min = Math.min(fitScale(), 1) * 0.5;
+    newScale = Math.max(min, Math.min(newScale, 16));
+    tx = cx - (cx - tx) * (newScale / scale);
+    ty = cy - (cy - ty) * (newScale / scale);
+    scale = newScale;
+    userZoomed = true;
+    apply();
+  }
+
+  function hideImage() {
+    img.style.display = 'none';
+    img.removeAttribute('src');
+    natW = natH = 0;
+    shownUrl = null;
+    shownKind = null;
+    if (!isVideo) empty.style.display = 'flex';
+    apply();
+  }
+
+  // Show an image. The chat thumbnail ('preview') is fitted to the window the
+  // same way the full resolution image will be, which then replaces it at the
+  // very same on-screen size - the picture only gets sharper.
+  function show(url, kind) {
+    if (!url || url === shownUrl) return;
+    if (kind === 'preview' && ((!fresh && shownKind === 'full') || pendingFull)) return;
+    if (kind === 'full') pendingFull = url;
+    const myGen = gen;
+    const probe = new Image();
+    probe.onload = async () => {
+      try { await probe.decode(); } catch {}
+      if (myGen !== gen) return;
+      if (kind === 'full') {
+        if (pendingFull !== url) return; // a newer one is on its way
+        pendingFull = null;
+      }
+      const w = probe.naturalWidth, h = probe.naturalHeight;
+      const replacing = !fresh && natW;
+      if (replacing && shownKind === kind && w * h <= natW * natH) return; // not better
+      if (replacing && shownKind === 'full' && kind === 'preview') return;
+
+      clearTimeout(hideTimer);
+      if (replacing) {
+        const oldAspect = natW / natH;
+        const sameAspect = Math.abs(w / h - oldAspect) / oldAspect < SAME_ASPECT;
+        if (sameAspect) {
+          // keep the exact on-screen rectangle, only the resolution changes
+          scale = (natW * scale) / w;
+          natW = w; natH = h;
+        } else {
+          // the thumbnail was a crop (e.g. square tiles of multi-photo
+          // messages): the real proportions only show up now
+          natW = w; natH = h;
+          fit();
+        }
+      } else {
+        fresh = false;
+        allowUpscale = kind === 'preview';
+        natW = w; natH = h;
+        fit();
+      }
+      img.src = url;
+      img.style.display = 'block';
+      empty.style.display = 'none';
+      shownUrl = url;
+      shownKind = kind;
+      apply();
+      window.viewer.shown(url);
+    };
+    probe.onerror = () => {
+      if (myGen === gen && pendingFull === url) pendingFull = null;
+    };
+    probe.src = url;
+  }
+
+  // A new photo of the gallery comes: keep the old one on screen for a moment
+  // (the next one is often cached and shows up right away) to avoid flicker
+  function reset(info) {
+    gen++;
+    fresh = true;
+    pendingFull = null;
+    userZoomed = false;
+    isVideo = false;
+    playBtn.classList.remove('show');
+    statusEl.className = 'status hidden';
+    index = info.index;
+    total = info.total;
+    counterEl.textContent = `${index + 1} / ${total}`;
+    counterEl.classList.toggle('hidden', total <= 1);
+    prevBtn.classList.toggle('hidden', index <= 0);
+    nextBtn.classList.toggle('hidden', index >= total - 1);
+    clearTimeout(hideTimer);
+    if (shownUrl) hideTimer = setTimeout(hideImage, 150);
+  }
+
+  let statusTimer;
+  function setStatus(status) {
+    clearTimeout(statusTimer);
+    if (status === 'loading') {
+      statusEl.className = 'status';
+      statusText.textContent = 'Teljes felbontás betöltése…';
+    } else if (status === 'failed') {
+      statusEl.className = 'status idle';
+      statusText.textContent = 'A teljes felbontású kép nem érhető el';
+      statusTimer = setTimeout(() => statusEl.classList.add('hidden'), 3000);
+    } else if (status === 'video') {
+      isVideo = true;
+      statusEl.className = 'status hidden';
+      empty.style.display = 'none';
+      playBtn.classList.add('show');
+    } else {
+      statusEl.className = 'status hidden';
+    }
+  }
+
+  let toastTimer;
+  function toast(text) {
+    toastEl.textContent = text;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1500);
+  }
+
+  function imageCenter() {
+    const r = img.getBoundingClientRect();
+    const x = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
+    const y = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
+    return [Math.round(x), Math.round(y)];
+  }
+
+  function navigate(step) {
+    const i = index + step;
+    if (i < 0 || i >= total) return;
+    window.viewer.navigate(step);
+  }
+
+  window.viewer.onImage(show);
+  window.viewer.onStatus(setStatus);
+  window.viewer.onReset(reset);
+
+  // wheel zooms around the cursor
+  stage.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    zoomAt(scale * Math.pow(1.0015, -e.deltaY), e.clientX, e.clientY);
+  }, { passive: false });
+
+  // drag to pan; a click on the background (not a drag) closes the viewer
+  let drag = null;
+  stage.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX, y: e.clientY, tx, ty, moved: false, onImage: e.target === img };
+    if (drag.onImage) img.classList.add('dragging');
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+    drag.moved = true;
+    if (!drag.onImage) return;
+    tx = drag.tx + dx;
+    ty = drag.ty + dy;
+    userZoomed = true;
+    apply();
+  });
+  window.addEventListener('mouseup', () => {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    img.classList.remove('dragging');
+    if (!d.moved && !d.onImage) window.viewer.close();
+  });
+
+  // double click: toggle between "fit to window" and 100%
+  img.addEventListener('dblclick', (e) => {
+    if (Math.abs(scale - 1) < 0.01 && fitScale() < 1) fit();
+    else zoomAt(1, e.clientX, e.clientY);
+  });
+
+  window.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    window.viewer.contextMenu(e.clientX, e.clientY, e.target === img);
+  });
+
+  window.addEventListener('keydown', (e) => {
+    const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+    if (e.key === 'Escape') window.viewer.close();
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') navigate(-1);
+    else if (e.key === 'ArrowRight' || e.key === 'PageDown') navigate(1);
+    else if (e.key === 'Enter' && isVideo) window.viewer.playVideo();
+    else if (e.key === '+' || e.key === '=') zoomAt(scale * 1.25, cx, cy);
+    else if (e.key === '-') zoomAt(scale / 1.25, cx, cy);
+    else if (e.key === '0') fit();
+    else if (e.key === '1') zoomAt(1, cx, cy);
+    else if (e.ctrlKey && e.key.toLowerCase() === 's') { e.preventDefault(); window.viewer.save(); }
+    else if (e.ctrlKey && e.key.toLowerCase() === 'c' && shownUrl) {
+      window.viewer.copyImage(...imageCenter());
+      toast('Kép másolva');
+    } else return;
+    e.preventDefault();
+  });
+
+  window.addEventListener('resize', () => {
+    if (!userZoomed) fit();
+  });
+
+  const btn = (id, fn) => document.getElementById(id).addEventListener('click', (e) => {
+    e.stopPropagation();
+    fn();
+  });
+  btn('btnClose', () => window.viewer.close());
+  btn('btnBrowser', () => window.viewer.openInBrowser());
+  btn('btnSave', () => window.viewer.save());
+  btn('btnCopy', () => { window.viewer.copyLink(); toast('Link másolva'); });
+  btn('prev', () => navigate(-1));
+  btn('next', () => navigate(1));
+  btn('play', () => window.viewer.playVideo());
+  for (const b of document.querySelectorAll('button')) {
+    b.addEventListener('mousedown', (e) => e.stopPropagation());
+    b.addEventListener('dblclick', (e) => e.stopPropagation());
+  }
+  apply();
+})();
+</script>
+</body>
+</html>
