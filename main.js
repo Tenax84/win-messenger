@@ -265,6 +265,8 @@ function isHttpUrl(url) {
 // The best URL to hand to the browser / clipboard for the shown image
 function viewerLinkUrl() {
   if (!current) return null;
+  // the fbcdn video links expire - the Facebook page is the one worth sharing
+  if (current.item.video) return current.item.url;
   return isHttpUrl(current.shownUrl) ? current.shownUrl : current.item.url;
 }
 
@@ -344,6 +346,178 @@ function createResolver(pageUrl, handlers) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// Video links (reels, /share/r/, /watch, ...) play in the in-app viewer: the
+// page HTML Facebook serves contains direct, progressive MP4 links on fbcdn.net
+// (H.264 + AAC, plays in a plain <video>). The page is fetched with the app's
+// session (cookies included), so friends-only videos work too. If no link is
+// found, the video falls back to the media dialog with Facebook's own player.
+// ---------------------------------------------------------------------------
+
+const VIDEO_FETCH_TIMEOUT_MS = 12000;
+const VIDEO_CACHE_MS = 30 * 60 * 1000; // the fbcdn links expire after a while
+const videoCache = new Map(); // page URL -> { src, poster, time }
+// best first: HD/SD progressive files (with sound)
+const VIDEO_SOURCE_KEYS = ['browser_native_hd_url', 'playable_url_quality_hd', 'browser_native_sd_url', 'playable_url'];
+
+function findVideoSource(html) {
+  for (const key of VIDEO_SOURCE_KEYS) {
+    // plain JSON ("key":"...") or JSON embedded in a JS string (\"key\":\"...\")
+    const patterns = [
+      new RegExp('"' + key + '":"((?:[^"\\\\]|\\\\.)*)"', 'g'),
+      new RegExp('\\\\"' + key + '\\\\":\\\\"((?:[^"\\\\]|\\\\[^"])*)\\\\"', 'g'),
+    ];
+    for (const [i, re] of patterns.entries()) {
+      let m;
+      while ((m = re.exec(html))) {
+        let src = null;
+        try {
+          src = JSON.parse('"' + m[1] + '"');
+          if (i === 1) src = JSON.parse('"' + src + '"');
+        } catch {}
+        if (src && /^https:\/\/[^/]*fbcdn\.net\//.test(src)) return src;
+      }
+    }
+  }
+  return null;
+}
+
+// Diagnostics for failed video lookups: <userData>/video-debug.log (kept small)
+function logVideo(line) {
+  try {
+    const fs = require('fs');
+    const file = path.join(app.getPath('userData'), 'video-debug.log');
+    try {
+      if (fs.statSync(file).size > 200 * 1024) fs.unlinkSync(file);
+    } catch {}
+    fs.appendFileSync(file, new Date().toISOString() + ' ' + line + '\n');
+  } catch {}
+}
+
+function findVideoPoster(html) {
+  const m = /<meta property="og:image" content="([^"]+)"/.exec(html);
+  if (!m) return null;
+  const poster = m[1].replace(/&amp;/g, '&');
+  return /^https:\/\//.test(poster) ? poster : null;
+}
+
+// Fetches the page with the given session; resolves to { src, poster } or null
+async function fetchVideoPage(ses, pageUrl, label) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), VIDEO_FETCH_TIMEOUT_MS);
+  const t0 = Date.now();
+  try {
+    const res = await ses.fetch(pageUrl, {
+      credentials: 'include',
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': CHROME_UA(ses.getUserAgent()),
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'hu-HU,hu;q=0.9,en;q=0.8',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Upgrade-Insecure-Requests': '1',
+      },
+    });
+    const html = res.ok ? await res.text() : '';
+    const src = html ? findVideoSource(html) : null;
+    logVideo(
+      `[${label}] ${pageUrl} -> ${res.status} ${res.url || ''} len=${html.length} ` +
+        `${Date.now() - t0}ms src=${src ? 'OK' : 'none'}` +
+        (src ? '' : ` keys=${VIDEO_SOURCE_KEYS.map((k) => k + ':' + (html.split(k).length - 1)).join(',')}`),
+    );
+    if (!src) return null;
+    return { src, poster: findVideoPoster(html) };
+  } catch (err) {
+    logVideo(`[${label}] ${pageUrl} -> error ${err && err.message} ${Date.now() - t0}ms`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Resolves to { src, poster } or null if no playable link is found. The page is
+// fetched both with the logged-in session (friends-only videos) and without
+// cookies (Facebook serves logged-in users a different, client-rendered page
+// that may not contain the links); the logged-in result wins when it has one.
+// A lookup already running for a page (e.g. a background prefetch) is shared,
+// so clicking a link that is still being prefetched doesn't start it again.
+const videoPending = new Map(); // page URL -> Promise
+function resolveVideo(pageUrl) {
+  const cached = videoCache.get(pageUrl);
+  if (cached && Date.now() - cached.time < VIDEO_CACHE_MS) return Promise.resolve(cached);
+  if (videoPending.has(pageUrl)) return videoPending.get(pageUrl);
+  const run = (async () => {
+    const anon = session.fromPartition('video-anon'); // in-memory, no cookies
+    const anonFetch = fetchVideoPage(anon, pageUrl, 'anon');
+    const found = (await fetchVideoPage(session.defaultSession, pageUrl, 'login')) || (await anonFetch);
+    if (!found) return null;
+    const result = { ...found, time: Date.now() };
+    videoCache.set(pageUrl, result);
+    return result;
+  })().finally(() => videoPending.delete(pageUrl));
+  videoPending.set(pageUrl, run);
+  return run;
+}
+
+// Background prefetch of video links appearing in the chat (preload.js reports
+// them), so a click can start playback right away. Runs a couple at a time;
+// links whose lookup failed are not retried by the prefetcher for a while
+// (a click still tries again).
+const VIDEO_PREFETCH_CONCURRENCY = 2;
+const VIDEO_PREFETCH_MAX_QUEUE = 20;
+const VIDEO_PREFETCH_FAIL_MS = 10 * 60 * 1000;
+const videoPrefetchQueue = [];
+const videoPrefetchFailed = new Map(); // page URL -> time of the failed lookup
+let videoPrefetchRunning = 0;
+
+function queueVideoPrefetch(pageUrl) {
+  const cached = videoCache.get(pageUrl);
+  // refresh a bit before the cached link would expire
+  if (cached && Date.now() - cached.time < VIDEO_CACHE_MS - 5 * 60 * 1000) return;
+  const failed = videoPrefetchFailed.get(pageUrl);
+  if (failed && Date.now() - failed < VIDEO_PREFETCH_FAIL_MS) return;
+  if (videoPending.has(pageUrl) || videoPrefetchQueue.includes(pageUrl)) return;
+  videoPrefetchQueue.push(pageUrl);
+  // newest links matter most: drop the oldest ones from an overfull queue
+  if (videoPrefetchQueue.length > VIDEO_PREFETCH_MAX_QUEUE) videoPrefetchQueue.shift();
+  pumpVideoPrefetch();
+}
+
+function pumpVideoPrefetch() {
+  while (videoPrefetchRunning < VIDEO_PREFETCH_CONCURRENCY && videoPrefetchQueue.length) {
+    const pageUrl = videoPrefetchQueue.pop(); // newest first
+    videoPrefetchRunning++;
+    if (videoCache.has(pageUrl)) videoCache.delete(pageUrl); // stale: fetch a fresh link
+    resolveVideo(pageUrl)
+      .then((video) => {
+        if (video) videoPrefetchFailed.delete(pageUrl);
+        else videoPrefetchFailed.set(pageUrl, Date.now());
+      })
+      .catch(() => videoPrefetchFailed.set(pageUrl, Date.now()))
+      .finally(() => {
+        videoPrefetchRunning--;
+        pumpVideoPrefetch();
+      });
+  }
+}
+
+function showVideoItem(state) {
+  const { item } = state;
+  if (item.thumb) sendToViewer('viewer:image', item.thumb, 'preview');
+  sendToViewer('viewer:status', 'video-loading');
+  resolveVideo(item.url).then((video) => {
+    if (current !== state) return;
+    if (!video) {
+      openCurrentAsVideo();
+      return;
+    }
+    state.videoSrc = video.src;
+    sendToViewer('viewer:video', video.src, video.poster || item.thumb || null);
+  });
+}
+
 function stopPrefetch() {
   stopResolver(prefetch);
   prefetch = null;
@@ -395,6 +569,10 @@ function showGalleryItem(index, initial) {
 
   sendToViewer('viewer:reset', { index, total: gallery.items.length });
 
+  if (item.video) {
+    showVideoItem(state);
+    return;
+  }
   if (isDirectImageUrl(url)) {
     sendToViewer('viewer:image', url, 'full');
     startPrefetch();
@@ -513,10 +691,11 @@ function openImageViewer(items, index) {
   wc.focus();
 }
 
-// Photos go to the image viewer, everything else (videos, posts) to the
+// Photos and videos go to the in-app viewer, everything else (posts) to the
 // media dialog
 function openMedia(url, thumbUrl) {
   if (isImageViewerUrl(url)) openImageViewer([{ url, thumb: thumbUrl || null }], 0);
+  else if (isVideoUrl(url)) openImageViewer([{ url, thumb: thumbUrl || null, video: true }], 0);
   else openVideoWindow(url);
 }
 
@@ -557,10 +736,24 @@ ipcMain.on('viewer:copy-link', (event) => {
   if (url) clipboard.writeText(url);
 });
 
+// What "save" downloads: the playing video file or the shown image
+function viewerSaveUrl() {
+  if (!current) return null;
+  return current.item.video ? current.videoSrc || null : current.shownUrl;
+}
+
 ipcMain.on('viewer:save', (event) => {
-  if (!isFromViewer(event) || !current) return;
-  const url = current.shownUrl;
+  if (!isFromViewer(event)) return;
+  const url = viewerSaveUrl();
   if (url) imageView.webContents.downloadURL(url);
+});
+
+// The <video> couldn't play the direct link - use Facebook's own player
+ipcMain.on('viewer:video-error', (event, info) => {
+  if (!isFromViewer(event) || !current || !current.item.video) return;
+  logVideo(`[play] ${current.item.url} -> video error ${String(info || '').slice(0, 200)}`);
+  if (current.videoSrc) videoCache.delete(current.item.url);
+  openCurrentAsVideo();
 });
 
 ipcMain.on('viewer:copy-image', (event, x, y) => {
@@ -581,9 +774,9 @@ ipcMain.on('viewer:context-menu', (event, x, y, onImage) => {
       if (url) clipboard.writeText(url);
     },
   });
-  const shownUrl = current.shownUrl;
-  if (shownUrl) {
-    items.push({ label: 'Mentés másként…', click: () => wc.downloadURL(shownUrl) });
+  const saveUrl = viewerSaveUrl();
+  if (saveUrl) {
+    items.push({ label: 'Mentés másként…', click: () => wc.downloadURL(saveUrl) });
   }
   if (gallery && gallery.items.length > 1) {
     items.push({ type: 'separator' });
@@ -943,6 +1136,17 @@ ipcMain.on('open-media-dialog', (event, url, thumbUrl) => {
   const target = unwrapLinkShim(url);
   const thumb = typeof thumbUrl === 'string' && /^(https:|data:image\/)/.test(thumbUrl) ? thumbUrl : null;
   openMedia(target, thumb);
+});
+
+// Video links seen in the open chat (preload.js), newest last: look up their
+// direct MP4 link in the background so a click plays immediately
+ipcMain.on('prefetch-videos', (event, urls) => {
+  if (!Array.isArray(urls)) return;
+  for (const url of urls.slice(-VIDEO_PREFETCH_MAX_QUEUE)) {
+    if (typeof url !== 'string') continue;
+    const target = unwrapLinkShim(url);
+    if (isVideoUrl(target)) queueVideoPrefetch(target);
+  }
 });
 
 ipcMain.on('show-context-menu', (event, params) => {

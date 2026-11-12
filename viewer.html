@@ -2,7 +2,7 @@
 <html lang="hu">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <style>
   html, body {
     margin: 0;
@@ -25,6 +25,21 @@
     image-rendering: auto;
   }
   #img.dragging { cursor: grabbing; }
+  /* below the toolbar, so its buttons never cover the player controls */
+  #video {
+    position: fixed;
+    left: 24px;
+    right: 24px;
+    top: 60px;
+    bottom: 24px;
+    width: calc(100% - 48px);
+    height: calc(100% - 84px);
+    object-fit: contain;
+    background: transparent;
+    outline: none;
+    display: none;
+    z-index: 1;
+  }
   .toolbar {
     position: fixed;
     top: 12px;
@@ -167,12 +182,13 @@
 </head>
 <body>
   <div id="stage"><img id="img" alt=""></div>
+  <video id="video" controls playsinline preload="auto"></video>
   <div class="empty" id="empty"><div class="spinner"></div></div>
   <div class="counter hidden" id="counter"></div>
   <div class="toolbar">
     <button id="btnSave" title="Mentés másként (Ctrl+S)">Mentés</button>
-    <button id="btnCopy" title="Kép linkjének másolása">Link másolása</button>
-    <button id="btnBrowser" title="Kép megnyitása böngészőben">Megnyitás böngészőben</button>
+    <button id="btnCopy" title="Link másolása">Link másolása</button>
+    <button id="btnBrowser" title="Megnyitás böngészőben">Megnyitás böngészőben</button>
     <button id="btnClose" class="icon" title="Bezárás (Esc)">&#x2715;</button>
   </div>
   <button class="nav hidden" id="prev" title="Előző kép (←)">&#x2039;</button>
@@ -194,6 +210,7 @@
   const prevBtn = document.getElementById('prev');
   const nextBtn = document.getElementById('next');
   const playBtn = document.getElementById('play');
+  const video = document.getElementById('video');
 
   const MARGIN = 24;
   const SAME_ASPECT = 0.03;     // relative aspect ratio difference still "the same"
@@ -208,7 +225,8 @@
   let fresh = true;             // the shown image (if any) belongs to the previous photo
   let hideTimer = null;
   let index = 0, total = 1;
-  let isVideo = false;
+  let isVideo = false;          // a gallery video: offers the play button (media dialog)
+  let videoMode = false;        // a video link playing in our own <video>
 
   function fitScale() {
     const w = window.innerWidth - MARGIN * 2;
@@ -249,7 +267,7 @@
     natW = natH = 0;
     shownUrl = null;
     shownKind = null;
-    if (!isVideo) empty.style.display = 'flex';
+    if (!isVideo && !videoMode) empty.style.display = 'flex';
     apply();
   }
 
@@ -308,9 +326,46 @@
     probe.src = url;
   }
 
+  // A video link: the direct MP4 replaces the preview image
+  function playVideo(url, poster) {
+    gen++; // drop a preview image still loading
+    clearTimeout(hideTimer);
+    pendingFull = null;
+    img.style.display = 'none';
+    img.removeAttribute('src');
+    natW = natH = 0;
+    shownUrl = null;
+    shownKind = null;
+    videoMode = true;
+    empty.style.display = 'none';
+    statusEl.className = 'status hidden';
+    if (poster) video.poster = poster;
+    else video.removeAttribute('poster');
+    video.src = url;
+    video.style.display = 'block';
+    video.play().catch(() => {});
+    video.focus();
+    apply();
+  }
+
+  function stopVideo() {
+    if (!videoMode) return;
+    videoMode = false;
+    video.pause();
+    video.removeAttribute('src');
+    video.removeAttribute('poster');
+    video.load();
+    video.style.display = 'none';
+  }
+
+  video.addEventListener('error', () => {
+    if (videoMode && video.getAttribute('src')) window.viewer.videoError(video.error ? video.error.code + ' ' + (video.error.message || '') : '');
+  });
+
   // A new photo of the gallery comes: keep the old one on screen for a moment
   // (the next one is often cached and shows up right away) to avoid flicker
   function reset(info) {
+    stopVideo();
     gen++;
     fresh = true;
     pendingFull = null;
@@ -334,6 +389,9 @@
     if (status === 'loading') {
       statusEl.className = 'status';
       statusText.textContent = 'Teljes felbontás betöltése…';
+    } else if (status === 'video-loading') {
+      statusEl.className = 'status';
+      statusText.textContent = 'Videó betöltése…';
     } else if (status === 'failed') {
       statusEl.className = 'status idle';
       statusText.textContent = 'A teljes felbontású kép nem érhető el';
@@ -371,6 +429,7 @@
 
   window.viewer.onImage(show);
   window.viewer.onStatus(setStatus);
+  window.viewer.onVideo(playVideo);
   window.viewer.onReset(reset);
 
   // wheel zooms around the cursor
@@ -419,6 +478,12 @@
   window.addEventListener('keydown', (e) => {
     const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
     if (e.key === 'Escape') window.viewer.close();
+    else if (videoMode && !e.ctrlKey && (e.key === ' ' || e.key.toLowerCase() === 'k')) {
+      if (video.paused) video.play().catch(() => {});
+      else video.pause();
+    } else if (videoMode && total <= 1 && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      video.currentTime = Math.max(0, video.currentTime + (e.key === 'ArrowLeft' ? -5 : 5));
+    } else if (videoMode && e.key.toLowerCase() === 'm') video.muted = !video.muted;
     else if (e.key === 'ArrowLeft' || e.key === 'PageUp') navigate(-1);
     else if (e.key === 'ArrowRight' || e.key === 'PageDown') navigate(1);
     else if (e.key === 'Enter' && isVideo) window.viewer.playVideo();

@@ -4,6 +4,9 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('viewer', {
   // kind: 'preview' (the chat thumbnail) or 'full'
   onImage: (cb) => ipcRenderer.on('viewer:image', (e, url, kind) => cb(url, kind)),
+  // a video link: direct MP4 URL plus an optional poster image
+  onVideo: (cb) => ipcRenderer.on('viewer:video', (e, url, poster) => cb(url, poster)),
+  videoError: (info) => ipcRenderer.send('viewer:video-error', String(info || '')),
   onStatus: (cb) => ipcRenderer.on('viewer:status', (e, status) => cb(status)),
   // a new photo of the gallery is about to be shown: { index, total }
   onReset: (cb) => ipcRenderer.on('viewer:reset', (e, info) => cb(info)),

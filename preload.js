@@ -154,6 +154,70 @@ document.addEventListener(
   true
 );
 
+// Video links (reels, /share/r/, watch, ...) appearing in the open chat are
+// reported to main.js, which looks up their direct MP4 link in the background,
+// so clicking one starts playback right away. Hovering a link reports it too.
+function videoHref(a) {
+  try {
+    let u = new URL(a.href);
+    if (u.hostname.endsWith('facebook.com') && u.pathname === '/l.php') {
+      const target = u.searchParams.get('u');
+      if (target) u = new URL(target);
+    }
+    if (u.hostname === 'fb.watch') return u.href;
+    if (!u.hostname.endsWith('facebook.com')) return null;
+    const p = u.pathname;
+    if (
+      p.startsWith('/share/r/') ||
+      p.startsWith('/share/v/') ||
+      p.startsWith('/reel') ||
+      p.startsWith('/watch') ||
+      p.startsWith('/video.php') ||
+      /^\/[^/]+\/videos\//.test(p)
+    )
+      return u.href;
+  } catch {}
+  return null;
+}
+
+const reportedVideos = new Set();
+let videoScanTimer = null;
+let lastHoveredVideo = null;
+
+function scanVideoLinks() {
+  videoScanTimer = null;
+  const root = document.querySelector('[role="main"]');
+  if (!root) return;
+  const urls = [];
+  for (const a of root.querySelectorAll('a[href]')) {
+    const url = videoHref(a);
+    if (url && !reportedVideos.has(url)) {
+      reportedVideos.add(url);
+      urls.push(url);
+    }
+  }
+  if (urls.length) ipcRenderer.send('prefetch-videos', urls); // DOM order: newest last
+}
+
+function scheduleVideoScan() {
+  if (!videoScanTimer) videoScanTimer = setTimeout(scanVideoLinks, 800);
+}
+
+new MutationObserver(scheduleVideoScan).observe(document, { childList: true, subtree: true });
+
+document.addEventListener(
+  'mouseover',
+  (e) => {
+    const a = e.target.closest && e.target.closest('a[href]');
+    const url = a && videoHref(a);
+    if (!url || url === lastHoveredVideo) return;
+    lastHoveredVideo = url;
+    // re-sent on hover: main.js skips it when a fresh link is already cached
+    ipcRenderer.send('prefetch-videos', [url]);
+  },
+  true
+);
+
 // Switch chats on mousedown instead of click: the SPA starts loading the
 // conversation ~0.1-0.2s earlier. The synthetic click goes through FB's own
 // router; the real click that follows on mouseup is swallowed so the chat
